@@ -1,4 +1,4 @@
-# bloqade visual compiler 
+# Bloqade Visual Compiler 
 
 A **ManimGL** project that animates the full compilation pipeline for a Bloqade squin circuit: from logical gates through native placement to qubit routing on a physical topology.
 
