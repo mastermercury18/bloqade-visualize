@@ -28,27 +28,13 @@ So you see: **logical circuit → native circuit + placement + gate-to-site mapp
 From the repo root:
 
 ```bash
+pip install bloqade
+pip install bloqade.lanes
+pip install bloqade.circuit
 python3 -m manimlib demo/squin_qat_smoke.py SquinQATSmokeScene
 ```
 
 This opens the ManimGL window and plays the three-layer animation. The circuit used is the built-in one: 3 qubits, `H(q0)`, `CX(q0,q1)`, `CX(q0,q2)` (see `demo_logical` / `demo_native` in the script).
-
-## Circuit and pipeline details
-
-- **Logical** uses a squin kernel with explicit qubit args (`demo_logical`) for the first view.
-- **Native** uses a kernel with `qubit.qalloc(3)` and `@squin.kernel(typeinfer=True, fold=True)` (`demo_native`). That kernel is passed to `SquinToNative().emit()`, then `AggressiveUnroll` is applied; the result drives both the native circuit drawing and the placement/routing analysis.
-- **Layout and placement** come from `compute_layout_and_gate_sites_xy_from_native()` and `compute_layout_and_gate_routes_from_native()` (layout heuristic and placement strategy are the fixed ones from `bloqade.lanes.heuristics.fixed`).
-- **Physical topology** (site positions, site buses, word buses) is given by `LogicalLayoutHeuristic().arch_spec`; the scene draws rings at each site, optional grid lines, and bus lines for the routing layer.
-
-## Main helpers in the script
-
-| Name | Purpose |
-|------|--------|
-| `make_laser_cone(...)` | Green cone + dot used for “laser” pulses at gate sites. |
-| `compute_layout_and_gate_sites_xy_from_native(native_mt, ...)` | Returns `(initial_layout, list of GateSiteXY)` for the placed native method. |
-| `compute_layout_and_gate_routes_from_native(native_mt, ...)` | Returns `(initial_layout, list of GateRoute)` with move layers and layout-after per gate. |
-| `GateRoute` | Dataclass: `op`, `logical_qubits`, `sites`, `xy`, `move_layers`, `layout_after`. |
-| `_split_group(group)` | In-scene helper: splits a possible (background, circuit) group from `build_squin_circuit_qat`. |
 
 ## Changing the circuit
 
@@ -59,7 +45,3 @@ Edit the two kernels at the top of `squin_qat_smoke.py`:
 
 Then run the same command again to re-render the three layers.
 
-## Other demo files
-
-- **`squin_scene.py`** — ManimCE scene that only draws the logical circuit (no placement/routing).
-- **`squin_scene_qat.py`** — ManimGL scene that draws a single squin circuit with QAT styling (`build_squin_circuit_qat`).
