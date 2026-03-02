@@ -1,57 +1,112 @@
-from manimlib import (
-    DOWN,
-    LEFT,
-    UP,
-    FadeIn,
-    FadeOut,
-    Scene,
-    Tex,
-    VGroup,
-    Group,
-    Dot,
-    Circle,
-    Line,
-    Rectangle,
-    Polygon,
-    FRAME_WIDTH,
-    FRAME_HEIGHT,
-    ORANGE,
-    TEAL,
-    YELLOW,
-    GREEN,
-    GREY_B,
-)
+"""ManimGL scene: Logical circuit -> Native+Placement -> Qubit Routing."""
 
-from dataclasses import dataclass
-import numpy as np
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
-from bloqade import qubit, squin
-from bloqade.lanes.heuristics.fixed import LogicalLayoutHeuristic, LogicalPlacementStrategy
-from bloqade.lanes.layout.encoding import LaneAddress, LocationAddress, MoveType
+import numpy as np
 
-# IMPORTANT:
-# - emit_native: for a circuit visualization QAT can render
-# - compute_layout_and_gate_sites_xy: for placed/native ops + physical sites (+ xy)
-from bloqade.lanes.native_pipeline import GateSiteXY
-from bloqade.lanes.upstream import NativeToPlace
+from manimlib import (
+    DOWN,
+    FRAME_HEIGHT,
+    FRAME_WIDTH,
+    LEFT,
+    FadeIn,
+    FadeOut,
+    GREEN,
+    GREY_B,
+    Group,
+    ORANGE,
+    Scene,
+    TEAL,
+    Tex,
+    UP,
+    VGroup,
+    YELLOW,
+    Circle,
+    Dot,
+    Line,
+    Polygon,
+    Rectangle,
+)
+
+from bloqade import qubit, squin
 from bloqade.analysis import address
 from bloqade.lanes.analysis import layout as layout_analysis
 from bloqade.lanes.analysis import placement as placement_analysis
 from bloqade.lanes.dialects import place
+from bloqade.lanes.heuristics.fixed import LogicalLayoutHeuristic, LogicalPlacementStrategy
+from bloqade.lanes.layout.encoding import LaneAddress, LocationAddress, MoveType
+from bloqade.lanes.native_pipeline import GateSiteXY
+from bloqade.lanes.upstream import NativeToPlace
+from bloqade.lanes.visualize_squin import _extract_gate_ops, build_squin_circuit_qat
+from bloqade.native.upstream.squin2native import SquinToNative
+from bloqade.rewrite.passes.aggressive_unroll import AggressiveUnroll
+from quantum_animation_toolbox.quera_colors import BLACK, BackgroundColor
 
-# Prefer the local bloqade-circuit implementation for squin -> native decomposition.
 _ROOT = Path(__file__).resolve().parents[1]
 _CIRCUIT_SRC = _ROOT / "bloqade-circuit" / "src"
 if _CIRCUIT_SRC.exists():
     sys.path.insert(0, str(_CIRCUIT_SRC))
 
-from bloqade.native.upstream.squin2native import SquinToNative
-from bloqade.rewrite.passes.aggressive_unroll import AggressiveUnroll
+QUBIT_COLORS = (ORANGE, TEAL, YELLOW)
 
-from bloqade.lanes.visualize_squin import build_squin_circuit_qat, _extract_gate_ops
-from quantum_animation_toolbox.quera_colors import BackgroundColor, BLACK
+
+def _fade_in_circuit(scene, circuit, wire_time=0.6, label_time=0.6, gate_time=0.8):
+    """Fade in wires, labels, then gates (QAT circuit)."""
+    if getattr(circuit, "wires", None) is not None:
+        scene.play(FadeIn(circuit.wires), run_time=wire_time)
+    if getattr(circuit, "labels", None) is not None:
+        scene.play(FadeIn(circuit.labels), run_time=label_time)
+    for gate in getattr(circuit, "gates", []):
+        scene.play(FadeIn(gate), run_time=gate_time)
+
+
+def _split_group(maybe_group):
+    """Split (background, circuit) from build_squin_circuit_qat output."""
+    if hasattr(maybe_group, "gates"):
+        return None, maybe_group
+    try:
+        if len(maybe_group) >= 2:
+            return maybe_group[0], maybe_group[1]
+    except Exception:
+        pass
+    return None, maybe_group
+
+
+def _get_grid_positions(arch_spec, target_center, target_width, target_height, row_spacing):
+    """Return (raw_positions, grid_positions, map_pos_fn) for physical layout."""
+    raw_positions = {}
+    for word_id, word in enumerate(arch_spec.words):
+        for site_id in range(len(word.sites)):
+            loc = LocationAddress(word_id, site_id)
+            pts = arch_spec.get_positions(loc)
+            if pts:
+                raw_positions[(word_id, site_id)] = pts
+
+    xs = [p[0] for pts in raw_positions.values() for p in pts]
+    ys = [p[1] for pts in raw_positions.values() for p in pts]
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+    x_mid = (x_min + x_max) / 2
+    y_mid = (y_min + y_max) / 2
+    scale = min(
+        target_width / (x_max - x_min + 1e-6),
+        target_height / (y_max - y_min + 1e-6),
+    )
+
+    def map_pos(pt):
+        return (
+            (pt[0] - x_mid) * scale + target_center[0],
+            (pt[1] - y_mid) * scale * row_spacing + target_center[1],
+            0,
+        )
+
+    grid_positions = {}
+    for (word_id, site_id), pts in raw_positions.items():
+        grid_positions[(word_id, site_id)] = [map_pos(pt) for pt in pts]
+    return raw_positions, grid_positions, map_pos
+
 
 @squin.kernel
 def demo_logical(q0: qubit.Qubit, q1: qubit.Qubit, q2: qubit.Qubit):
@@ -260,48 +315,28 @@ def compute_layout_and_gate_routes_from_native(
 
 class SquinQATSmokeScene(Scene):
     def construct(self):
-        def _split_group(maybe_group):
-            if hasattr(maybe_group, "gates"):
-                return None, maybe_group
-            try:
-                if len(maybe_group) >= 2:
-                    return maybe_group[0], maybe_group[1]
-            except Exception:
-                pass
-            return None, maybe_group
-
-        # =========================
-        # Layer 1: Logical (UNCHANGED)
-        # =========================
+        # --- Layer 1: Logical ---
         title = Tex(r"\textbf{Logical: Defines the logical circuit we begin with.}").scale(0.7)
         title.to_edge(UP)
 
-        group = build_squin_circuit_qat(
-            demo_logical, use_qat_defaults=True, qat_style="quera", qat_format="demo"
+        background, circuit = _split_group(
+            build_squin_circuit_qat(
+                demo_logical, use_qat_defaults=True, qat_style="quera", qat_format="demo"
+            )
         )
-
-        background, circuit = _split_group(group)
 
         if background is not None:
             self.add(background)
 
         self.play(FadeIn(title), run_time=0.6)
 
-        if getattr(circuit, "wires", None) is not None:
-            self.play(FadeIn(circuit.wires), run_time=1.0)
-        if getattr(circuit, "labels", None) is not None:
-            self.play(FadeIn(circuit.labels), run_time=1.2)
-
-        for gate in getattr(circuit, "gates", []):
-            self.play(FadeIn(gate), run_time=0.8)
+        _fade_in_circuit(self, circuit, wire_time=1.0, label_time=1.2, gate_time=0.8)
 
         all_objs = Group(*self.mobjects)
         self.play(FadeOut(all_objs), run_time=0.6)
         self.clear()
 
-        # =========================
-        # Layer 2: Visualize "native" + map to array
-        # =========================
+        # --- Layer 2: Native + Placement ---
         layer2_bg = BackgroundColor(BLACK)
         layer2_title = Tex(
             r"\textbf{Native + Placement: Gates compiled and mapped to physical sites.}"
@@ -310,20 +345,9 @@ class SquinQATSmokeScene(Scene):
         self.add(layer2_bg)
         self.play(FadeIn(layer2_title), run_time=0.6)
 
-        # (A) VISUAL CIRCUIT: use the local squin2native decomposition directly
         native_mt = SquinToNative().emit(demo_native)
-        # Inline broadcast kernels so decompositions (e.g., CX -> sqrt_y, CZ, sqrt_y) appear explicitly.
         AggressiveUnroll(native_mt.dialects, no_raise=True).fixpoint(native_mt)
-        print("=== Native IR (after inline/decompose) ===")
-        native_mt.print()
-        print("=== Visualizer gate ops (after inline/decompose) ===")
         native_ops = list(_extract_gate_ops(native_mt))
-        for op in native_ops:
-            qubits = [str(q) for q in op.qubits]
-            controls = [str(q) for q in op.controls]
-            targets = [str(q) for q in op.targets]
-            print(f"{op.name} qubits={qubits} controls={controls} targets={targets}")
-        # Ensure the wire length can accommodate the decomposed gate count.
         # QAT uses discrete slots: num_slots = int(wire_length // pitch) + 1.
         slot_offset = 1
         gate_size = 0.6
@@ -350,76 +374,27 @@ class SquinQATSmokeScene(Scene):
 
         native_circuit.scale(0.85)
         native_circuit.to_edge(LEFT)
+        _fade_in_circuit(self, native_circuit, gate_time=1.0)
 
-        # Fade in circuit subparts explicitly (more reliable than FadeIn(circuit) in some QAT versions)
-        if getattr(native_circuit, "wires", None) is not None:
-            self.play(FadeIn(native_circuit.wires), run_time=0.6)
-        if getattr(native_circuit, "labels", None) is not None:
-            self.play(FadeIn(native_circuit.labels), run_time=0.6)
-        for g in getattr(native_circuit, "gates", []):
-            self.play(FadeIn(g), run_time=1)
-
-        # (B) EXTRACTION: placed/native ops + physical sites (+xy)
-        # Use the same unrolled native IR as the visual circuit to keep indices aligned.
         layout, gates_xy = compute_layout_and_gate_sites_xy_from_native(native_mt)
-
-        print("DEBUG layer2: initial layout size =", len(layout))
-        print("DEBUG layer2: extracted placed/native ops =", len(gates_xy))
-        if not gates_xy:
-            print("ERROR: gates_xy is empty. No placed ops found to animate.")
-            print("       This usually means no ConcreteState was produced or include_ops mismatch.")
-            # Still continue to show the grid so you can see something.
-
-        # (C) BUILD PHYSICAL GRID
         arch_spec = LogicalLayoutHeuristic().arch_spec
-        raw_positions: dict[tuple[int, int], list[tuple[float, float]]] = {}
-        for word_id, word in enumerate(arch_spec.words):
-            for site_id in range(len(word.sites)):
-                loc = LocationAddress(word_id, site_id)
-                pts = arch_spec.get_positions(loc)
-                if pts:
-                    raw_positions[(word_id, site_id)] = pts
-
-        xs = [p[0] for pts in raw_positions.values() for p in pts]
-        ys = [p[1] for pts in raw_positions.values() for p in pts]
-        x_min, x_max = min(xs), max(xs)
-        y_min, y_max = min(ys), max(ys)
-        x_mid = (x_min + x_max) / 2
-        y_mid = (y_min + y_max) / 2
-
-        target_width = 5.2
-        target_height = 3.0
-        # Place grid to the RIGHT of center (manim coords are centered at (0,0))
-        target_center = (3.8, -0.2, 0)
-
-        scale = min(
-            target_width / (x_max - x_min + 1e-6),
-            target_height / (y_max - y_min + 1e-6),
+        raw_positions, grid_positions, _ = _get_grid_positions(
+            arch_spec,
+            target_center=(3.8, -0.2, 0),
+            target_width=5.2,
+            target_height=3.0,
+            row_spacing=1.12,
         )
 
-        row_spacing = 1.12  # slightly increase spacing between rows
-
-        def map_pos(pt):
-            return (
-                (pt[0] - x_mid) * scale + target_center[0],
-                (pt[1] - y_mid) * scale * row_spacing + target_center[1],
-                0,
-            )
-
+        mapped_points = [p for pts in grid_positions.values() for p in pts]
         grid = VGroup()
         grid.set_z_index(5)
-        grid_positions = {}
-        mapped_points = []
-        for (word_id, site_id), pts in raw_positions.items():
-            mapped = [map_pos(pt) for pt in pts]
-            mapped_points.extend(mapped)
+        for (word_id, site_id), mapped in grid_positions.items():
             for pos in mapped:
-                # Empty traps: hollow circles
                 ring = Circle(radius=0.055, color=GREY_B, stroke_width=1.2)
                 ring.move_to(pos)
                 ring.set_z_index(5)
                 grid.add(ring)
-            grid_positions[(word_id, site_id)] = mapped
 
         # Faint grid lines
         if mapped_points:
@@ -484,7 +459,6 @@ class SquinQATSmokeScene(Scene):
             )
             grid.add(axes)
 
-
         grid_label = Tex(r"\textbf{Physical layout}").scale(0.55)
         grid_label.next_to(grid, UP, buff=0.3)
         grid_label.set_z_index(6)
@@ -498,12 +472,11 @@ class SquinQATSmokeScene(Scene):
         self.play(FadeIn(mapping_title), run_time=0.3)
 
         # Draw initial logical->physical placement dots (occupied sites)
-        colors = [ORANGE, TEAL, YELLOW]
+        colors = QUBIT_COLORS
         for i, addr in enumerate(layout):
             color = colors[i % len(colors)]
             key = (addr.word_id, addr.site_id)
             if key not in grid_positions:
-                print("WARN: layout site not in grid_positions:", key)
                 continue
             targets = grid_positions[key]
             for target in targets:
@@ -512,8 +485,6 @@ class SquinQATSmokeScene(Scene):
                 placed.move_to(target)
                 self.add(placed)
 
-        # (D) ANIMATE LASERS USING gates_xy (this guarantees something happens if extraction worked)
-        # If you want to slow down / speed up, tune these:
         on_time = 0.8
         off_time = 0.6
 
@@ -525,8 +496,6 @@ class SquinQATSmokeScene(Scene):
                 key = (loc.word_id, loc.site_id)
                 if key in grid_positions:
                     targets.extend(grid_positions[key])
-                else:
-                    print("WARN: gate site not in grid_positions:", key)
 
             if not targets:
                 continue
@@ -570,15 +539,15 @@ class SquinQATSmokeScene(Scene):
                 self.play(FadeOut(atom_group), run_time=off_time)
             self.wait(0.5)
 
-        # =========================
-        # Layer 3: Qubit Routing
-        # =========================
+        # --- Layer 3: Qubit Routing ---
         all_objs = Group(*self.mobjects)
         self.play(FadeOut(all_objs), run_time=0.6)
         self.clear()
 
         routing_bg = BackgroundColor(BLACK)
-        routing_title = Tex(r"\textbf{Qubit Routing: Moves happen in layers, then the gate fires.}").scale(0.8)
+        routing_title = Tex(
+            r"\textbf{Qubit Routing: Moves happen in layers, then the gate fires.}"
+        ).scale(0.8)
         routing_title.to_edge(UP)
         self.add(routing_bg)
         self.play(FadeIn(routing_title), run_time=0.6)
@@ -586,45 +555,17 @@ class SquinQATSmokeScene(Scene):
         routing_layout, gate_routes = compute_layout_and_gate_routes_from_native(
             native_mt
         )
-
         arch_spec = LogicalLayoutHeuristic().arch_spec
-        raw_positions = {}
-        for word_id, word in enumerate(arch_spec.words):
-            for site_id in range(len(word.sites)):
-                loc = LocationAddress(word_id, site_id)
-                pts = arch_spec.get_positions(loc)
-                if pts:
-                    raw_positions[(word_id, site_id)] = pts
-
-        xs = [p[0] for pts in raw_positions.values() for p in pts]
-        ys = [p[1] for pts in raw_positions.values() for p in pts]
-        x_min, x_max = min(xs), max(xs)
-        y_min, y_max = min(ys), max(ys)
-        x_mid = (x_min + x_max) / 2
-        y_mid = (y_min + y_max) / 2
-
-        target_width = FRAME_WIDTH * 0.9
-        target_height = FRAME_HEIGHT * 0.75
-        target_center = (0.0, -0.2, 0)
-
-        scale = min(
-            target_width / (x_max - x_min + 1e-6),
-            target_height / (y_max - y_min + 1e-6),
+        _, routing_positions, _ = _get_grid_positions(
+            arch_spec,
+            target_center=(0.0, -0.2, 0),
+            target_width=FRAME_WIDTH * 0.9,
+            target_height=FRAME_HEIGHT * 0.75,
+            row_spacing=1.05,
         )
-
-        row_spacing = 1.05
-
-        def map_pos_full(pt):
-            return (
-                (pt[0] - x_mid) * scale + target_center[0],
-                (pt[1] - y_mid) * scale * row_spacing + target_center[1],
-                0,
-            )
 
         routing_grid = VGroup()
         routing_grid.set_z_index(5)
-        routing_positions = {}
-        mapped_points = []
 
         # Topology lines (bus lanes)
         topo = VGroup()
@@ -635,9 +576,9 @@ class SquinQATSmokeScene(Scene):
                 for src_site, dst_site in zip(bus.src, bus.dst):
                     k0 = (word_id, src_site)
                     k1 = (word_id, dst_site)
-                    if k0 in raw_positions and k1 in raw_positions:
-                        p0 = map_pos_full(raw_positions[k0][0])
-                        p1 = map_pos_full(raw_positions[k1][0])
+                    if k0 in routing_positions and k1 in routing_positions:
+                        p0 = routing_positions[k0][0]
+                        p1 = routing_positions[k1][0]
                         topo.add(
                             Line(p0, p1, color=GREY_B, stroke_width=1.0)
                             .set_opacity(0.18)
@@ -649,9 +590,9 @@ class SquinQATSmokeScene(Scene):
                 for site_id in arch_spec.has_word_buses:
                     k0 = (src_word, site_id)
                     k1 = (dst_word, site_id)
-                    if k0 in raw_positions and k1 in raw_positions:
-                        p0 = map_pos_full(raw_positions[k0][0])
-                        p1 = map_pos_full(raw_positions[k1][0])
+                    if k0 in routing_positions and k1 in routing_positions:
+                        p0 = routing_positions[k0][0]
+                        p1 = routing_positions[k1][0]
                         topo.add(
                             Line(p0, p1, color=GREY_B, stroke_width=1.6)
                             .set_opacity(0.28)
@@ -659,16 +600,12 @@ class SquinQATSmokeScene(Scene):
                         )
 
         routing_grid.add(topo)
-
-        for (word_id, site_id), pts in raw_positions.items():
-            mapped = [map_pos_full(pt) for pt in pts]
-            mapped_points.extend(mapped)
+        for mapped in routing_positions.values():
             for pos in mapped:
                 ring = Circle(radius=0.055, color=GREY_B, stroke_width=1.2)
                 ring.move_to(pos)
                 ring.set_z_index(5)
                 routing_grid.add(ring)
-            routing_positions[(word_id, site_id)] = mapped
 
         routing_label = Tex(r"\textbf{Routing topology}").scale(0.6)
         routing_label.next_to(routing_grid, UP, buff=1)
@@ -679,7 +616,7 @@ class SquinQATSmokeScene(Scene):
         def loc_to_point(loc: LocationAddress):
             return routing_positions[(loc.word_id, loc.site_id)][0]
 
-        colors = [ORANGE, TEAL, YELLOW]
+        colors = QUBIT_COLORS
         current_layout = list(routing_layout)
         qubit_dots = []
         for i, addr in enumerate(current_layout):
